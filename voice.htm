@@ -1,0 +1,291 @@
+<html>
+    <head>
+        <title>Voice Fun</title>
+    </head>
+    <body>
+        <p>Default Voice: <select id="voice"></select></p>
+        <p>Padbot IP: <input type="text" id="ip" value="192.168.0.100"></input></p>
+        <p>Voice Script:</p>
+        <textarea id="message" style="width:80%;height:80vh;"></textarea>
+        <p>
+            <button onClick="sayIt(document.getElementById('message').value)">Say it!</button>
+            <button onClick="speechSynthesis.cancel();">Cancel</button>.
+        </p>        <p>Movement JSON:</p>
+        <textarea id="output" style="width:80%;height:80vh;"></textarea>
+
+<script>
+//Need this to prevent garbage collection from destroying the utterance before the end event triggers. Ugh
+window.utterances = [];
+cueList = [];
+
+function populateVoiceList() {
+    /***********************************************
+    * Populate DDL of voices. This also ensures the
+    * voice list is populated before it is needed.
+    ************************************************/
+    "use strict";
+    var voices = window.speechSynthesis.getVoices();
+    var option = {};
+
+    document.getElementById("voice").innerHTML = "";
+
+    voices.forEach(function (voice, i) {
+        option = document.createElement("option");
+        option.textContent = voice.name;
+        option.value = i;
+        document.getElementById("voice").appendChild(option);
+    });
+
+    if (voices.length > 0) {
+        window.speechSynthesis.onvoiceschanged = "";
+    }
+}
+
+// Sometimes the list gets populated right away, other times voices aren't available
+// until the onvoiceschanged event fires. Who knows why?
+populateVoiceList();
+window.speechSynthesis.onvoiceschanged = populateVoiceList;
+
+function sayIt(text) {
+    /***********************************************
+    * Reads contents of msg. Supports limited SSML:
+    *   voice tag (variant attribute only)
+    *   prosody tag (pitch, rate and volume attributes only.)
+    *   emphasis tag (unfortunately there will be an extra delay around it.)
+    *   break tag (time attribute only.)
+    *   p and s (no attributes, just causes a delay)
+    *   Note: any tag will cause a strong break.
+    *         Should not be wrapped in <speak> tags.
+    ************************************************/
+    "use strict";
+
+	var padbotIP = document.getElementById("ip").value;
+    var script = "<speak>" + text + "</speak>";
+    var scriptParser = new window.DOMParser();
+    var scriptDOM = scriptParser.parseFromString(script, "text/xml");
+    var voiceSelector = document.getElementById("voice");
+    var startTime = 0;
+    var msgQueue = [];
+    var voiceStack = [{
+        voiceVariant: voiceSelector.options[voiceSelector.selectedIndex].value,
+        rate: 1,
+        pitch: 1,
+        volume: 0.5
+    }];
+
+    const pitchValues = {
+        "x-low": 0.1,
+        low: 0.5,
+        medium: 1,
+        high: 1.5,
+        "x-high": 2,
+        default: 1
+    };
+    const rateValues = {
+        "x-slow": 0.1,
+        slow: 0.5,
+        medium: 1,
+        fast: 1.5,
+        "x-fast": 2,
+        default: 1
+    };
+    const volumeValues = {
+        silent: 0,
+        "x-soft": 0.1,
+        soft: 0.25,
+        medium: 0.5,
+        loud: 0.75,
+        "x-loud": 1,
+        default: 0.5
+    };
+    const emphasisValues = {
+        strong: {rate: 0.5, volume: 0.8},
+        moderate: {rate: 0.75, volume: 0.6},
+        reduced: {rate: 1.25, volume: 0.3}
+    };
+
+    function processQueue(msgQueue, delayReady = false) {
+        var timerDelay = msgQueue[0].delayBefore;
+        var hasCue = "cue" in msgQueue[0];
+        var blankMsg = new window.SpeechSynthesisUtterance();
+        var elapsed = 0;
+
+        if (timerDelay > 0 || hasCue) {
+            if (delayReady) { // Voice has stopped, so we know time for cue
+                if (hasCue) {
+					if (startTime == 0) { //Avoid initial delay. Assumes empty initial utterance.
+						startTime = Date.now();
+					}
+                    elapsed = Math.floor((Date.now() - startTime) / 100) / 10; // seconds to 1 decimal
+					if (msgQueue[0].cue.action) {
+						cueList.push(`{"time": ${elapsed}, "action": "${msgQueue[0].cue.action}"}`)
+						fetch(`http://${padbotIP}:8080${msgQueue[0].cue.action}`, {'mode': 'no-cors'})
+					} else {
+						cueList.push(`{"time": ${elapsed}, "stretch": ${msgQueue[0].cue.stretch}, "rotate": ${msgQueue[0].cue.rotate}, "height": ${msgQueue[0].cue.height}, "angle": ${msgQueue[0].cue.angle}, "speed": ${msgQueue[0].cue.speed}}`)
+                    }
+                    delete msgQueue[0].cue;
+                    processQueue(msgQueue);
+                } else {
+                    msgQueue[0].delayBefore = 0; // Remove delay for next iteration
+                    setTimeout(processQueue, timerDelay, msgQueue, true);
+                }
+            } else { // Must wait for voice to catch up
+                // Don't say anything. Msg is placeholder to fire end event
+                // when currently queued speech complete
+                blankMsg.onend = function () {
+                    processQueue(msgQueue, true);
+                };
+                window.utterances.push(blankMsg); //Must store in global context or end event won't fire
+                window.speechSynthesis.speak(blankMsg);
+            }
+        } else { //Just say it, and call the next iteration
+            window.speechSynthesis.speak(msgQueue[0].utterance);
+            msgQueue.shift();
+			if (startTime == 0) { //Avoid initial delay. Assumes empty initial utterance.
+			        startTime = Date.now();
+			}
+            if (msgQueue.length > 0) {
+                processQueue(msgQueue);
+            } else {
+                document.getElementById("output").value = '{"audiofile": "",\n"motions": [\n';
+                cueList.forEach(data => document.getElementById("output").value += "    " + data + ",\n");
+                document.getElementById("output").value += '    ]\n}';
+            }
+        }
+    }
+
+    function iterateSpeech(current, depth = 0) {
+        var children = current.childNodes;
+        var nodeType = Object.prototype.toString.call(current);
+        var timeParts = [];
+
+        function createUtterance(text, voiceProsody) {
+            var msg = new window.SpeechSynthesisUtterance();
+            var voices = window.speechSynthesis.getVoices();
+
+            msg.voice = voices[voiceProsody.voiceVariant];
+            msg.rate = voiceProsody.rate;
+            msg.pitch = voiceProsody.pitch;
+            msg.volume = voiceProsody.volume;
+            msg.text = text;
+            msg.lang = "en-us";
+            return msg;
+        }
+
+        if (nodeType === "[object Text]") { // It's text: add to queue to say
+            if (!(/^\s+$/).test(current.data)) { //ignore whitespace-only strings
+                msgQueue.push({
+                    utterance: createUtterance(current.data, voiceStack[0]),
+                    delayBefore: 0
+                });
+            }
+        } else if (nodeType === "[object Element]") { // It's an opening tag
+            switch (current.tagName) {
+            case "p":
+                msgQueue.push({
+                    utterance: createUtterance(" ", voiceStack[0]),
+                    delayBefore: 250
+                });
+                break;
+            case "cue": // contains cue attributes
+                msgQueue.push({
+                    utterance: createUtterance(" ", voiceStack[0]),
+                    delayBefore: 0,
+                    cue: {
+						action: current.getAttribute("action"),
+                        stretch: current.getAttribute("stretch"),
+                        rotate: current.getAttribute("rotate"),
+                        height: current.getAttribute("height"),
+                        angle: current.getAttribute("angle"),
+                        speed: current.getAttribute("speed")
+                        }
+                });
+                break;
+            case "break": // contains time attribute in 99ms or 99s format
+                timeParts = current.getAttribute("time").match(/[a-zA-Z]+|[0-9]+/g);
+                if (timeParts[1] === "s") {
+                    timeParts[0] = timeParts[0] * 1000;
+                }
+                msgQueue.push({
+                    utterance: createUtterance(" ", voiceStack[0]),
+                    delayBefore: timeParts[0]
+                });
+                break;
+            case "prosody": // contains variant attribute
+                voiceStack.unshift({
+                    voiceVariant: voiceStack[0].voiceVariant,
+                    rate: voiceStack[0].rate,
+                    pitch: voiceStack[0].pitch,
+                    volume: voiceStack[0].volume
+                });
+                if (current.hasAttribute("rate")) {
+                    voiceStack[0].rate = rateValues[current.getAttribute("rate")];
+                }
+                if (current.hasAttribute("pitch")) {
+                    voiceStack[0].pitch = pitchValues[current.getAttribute("pitch")];
+                }
+                if (current.hasAttribute("volume")) {
+                    voiceStack[0].volume = volumeValues[current.getAttribute("volume")];
+                }
+                break;
+            case "emphasis": // contains optional level attribute
+                voiceStack.unshift({
+                    voiceVariant: voiceStack[0].voiceVariant,
+                    rate: voiceStack[0].rate,
+                    pitch: voiceStack[0].pitch,
+                    volume: voiceStack[0].volume
+                });
+                if (current.hasAttribute("level")) {
+                    voiceStack[0].rate = emphasisValues[current.getAttribute("level")].rate;
+                    voiceStack[0].volume = emphasisValues[current.getAttribute("level")].volume;
+                } else {
+                    voiceStack[0].rate = emphasisValues.moderate.rate;
+                    voiceStack[0].volume = emphasisValues.moderate.volume;
+                }
+                break;
+            case "voice": // contains variant attribute
+                voiceStack.unshift({
+                    voiceVariant: current.getAttribute("variant"),
+                    rate: voiceStack[0].rate,
+                    pitch: voiceStack[0].pitch,
+                    volume: voiceStack[0].volume
+                });
+                break;
+            }
+        }
+
+        children.forEach(function (child) {
+            iterateSpeech(child, depth + 1);
+        });
+
+        if (nodeType === "[object Element]") { // It's a closing tag
+            switch (current.tagName) {
+            case "p":
+            case "s":
+                msgQueue.push({
+                    utterance: createUtterance(" ", voiceStack[0]),
+                    delayBefore: 250
+                });
+                break;
+            case "emphasis":
+            case "prosody":
+            case "voice":
+                voiceStack.shift();
+                break;
+            }
+        }
+    }
+
+    if (scriptDOM.getElementsByTagName("parsererror").length > 0) {
+        alert("Parse Error!");
+        console.log(scriptDOM);
+    } else {
+        iterateSpeech(scriptDOM);
+        cueList = [];
+        startTime = 0;
+        processQueue(msgQueue);
+    }
+}
+    </script>
+</body>
+</html>
